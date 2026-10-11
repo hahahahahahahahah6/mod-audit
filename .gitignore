@@ -23,6 +23,7 @@ venv/
 
 # Internal drafts — never publish to the public repo
 devto-draft.md
+devto-v02-article.md
 
 # OS / editor
 .DS_Store
