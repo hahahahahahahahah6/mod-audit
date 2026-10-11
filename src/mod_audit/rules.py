@@ -16,7 +16,7 @@ SEVERITIES = ("low", "medium", "high", "critical")
 _SEV_ORDER = {s: i for i, s in enumerate(SEVERITIES)}
 
 # Duplicated from mod_audit.__init__ to avoid a circular import at module load.
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 TS_EXTS = (".ts", ".js", ".mjs", ".cjs", ".tsx", ".jsx")
 CONFIG_FILES = ("plugin.json", "hooks.json", "package.json")
@@ -61,6 +61,9 @@ _RM_RF = re.compile(r"\brm\s+-[a-z]*r[a-z]*f\b|\brm\s+-rf?\s+[/~]", re.I)
 HOOK_CMD_KEYS = {"command", "cmd", "shell", "exec", "run", "script", "entrypoint"}
 # Ancestor keys under which free-form strings are treated as hook commands.
 HOOK_SECTION_KEYS = {"hooks", "lifecycle", "scripts"}
+# Metadata keys under a hooks section whose string values are NOT commands
+# (e.g. the {"type": "command"} discriminator in Claude Code hook configs).
+HOOK_META_KEYS = {"type", "matcher", "name", "timeout", "description", "title"}
 
 
 def _walk_hook_commands(node, ancestors: Tuple[str, ...] = ()) -> Iterator[Tuple[str, Tuple[str, ...]]]:
@@ -71,7 +74,12 @@ def _walk_hook_commands(node, ancestors: Tuple[str, ...] = ()) -> Iterator[Tuple
             key_l = str(key).lower()
             if key_l in HOOK_CMD_KEYS and isinstance(value, str) and value.strip():
                 yield value, ancestors + (str(key),)
-            elif in_hooks and isinstance(value, str) and value.strip():
+            elif (
+                in_hooks
+                and key_l not in HOOK_META_KEYS
+                and isinstance(value, str)
+                and value.strip()
+            ):
                 # Free-form string directly under a hooks/lifecycle/scripts
                 # section (e.g. {"hooks": {"setup": "npm install"}}).
                 yield value, ancestors + (str(key),)
