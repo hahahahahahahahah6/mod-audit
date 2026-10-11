@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+
+# Secrets / credentials — never commit
+.env
+*.env
+*token*
+*credential*
+*secret*
+*.pem
+*.key
+
+# Snapshots (local trust anchors, may embed machine paths)
+*.snapshot/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
