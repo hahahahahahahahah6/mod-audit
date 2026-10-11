@@ -6,7 +6,7 @@ snapshots a trusted state and diffs installed mods against it to catch
 trojanized updates.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .rules import Finding, scan_mod, scan_ts_source, scan_hook_commands, scan_permissions
 
