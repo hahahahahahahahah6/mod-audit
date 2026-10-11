@@ -21,6 +21,9 @@ venv/
 # Snapshots (local trust anchors, may embed machine paths)
 *.snapshot/
 
+# Internal drafts — never publish to the public repo
+devto-draft.md
+
 # OS / editor
 .DS_Store
 .idea/

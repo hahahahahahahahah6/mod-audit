@@ -1,4 +1,4 @@
-"""mod-audit CLI: scan, snapshot, diff for Claude Code Mods."""
+"""mod-audit CLI: scan, baseline (snapshot), diff for Claude Code Mods."""
 from __future__ import annotations
 
 import argparse
@@ -12,6 +12,8 @@ from .rules import (
     SEVERITIES,
     build_snapshot,
     diff_against_snapshot,
+    diff_verdict,
+    format_diff_report,
     scan_mod,
     severity_at_least,
 )
@@ -97,7 +99,11 @@ def cmd_diff(args) -> int:
         print(f"mod-audit: cannot read snapshot {manifest_path}: {exc}", file=sys.stderr)
         return 2
     findings = diff_against_snapshot(root, snapshot)
-    _emit(findings, args.format)
+    if args.format == "json":
+        print(json.dumps([f.to_dict() for f in findings], indent=2))
+        print(diff_verdict(findings), file=sys.stderr)
+    else:
+        sys.stdout.write(format_diff_report(findings, root, snapshot))
     if any(severity_at_least(f.severity, args.fail_on) for f in findings):
         return 1
     return 0
@@ -126,6 +132,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("path", help="Path to the mod directory.")
     s.add_argument("--out", help="Snapshot directory (default: ./<mod-name>.snapshot).")
     s.set_defaults(func=cmd_snapshot)
+
+    b = sub.add_parser(
+        "baseline",
+        help="Baseline an installed mod: hash its files and record hooks/permissions.",
+    )
+    b.add_argument("path", help="Path to the mod directory.")
+    b.add_argument("--out", help="Baseline snapshot directory (default: ./<mod-name>.snapshot).")
+    b.set_defaults(func=cmd_snapshot)
 
     s = sub.add_parser("diff", help="Diff an installed mod against a trusted snapshot.")
     s.add_argument("installed_dir", help="Path to the installed mod directory.")

@@ -16,7 +16,7 @@ SEVERITIES = ("low", "medium", "high", "critical")
 _SEV_ORDER = {s: i for i, s in enumerate(SEVERITIES)}
 
 # Duplicated from mod_audit.__init__ to avoid a circular import at module load.
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 TS_EXTS = (".ts", ".js", ".mjs", ".cjs", ".tsx", ".jsx")
 CONFIG_FILES = ("plugin.json", "hooks.json", "package.json")
@@ -56,6 +56,18 @@ _SUDO = re.compile(r"(?:^|[\s;&|])sudo(?:\s|$)", re.I)
 _REVERSE_SHELL = re.compile(r"\b(nc|netcat|ncat|socat)\b[^|;&\n]*-e\b|/dev/tcp/", re.I)
 _CHMOD_EXEC = re.compile(r"\bchmod\s+\+x\b", re.I)
 _RM_RF = re.compile(r"\brm\s+-[a-z]*r[a-z]*f\b|\brm\s+-rf?\s+[/~]", re.I)
+# Credential material: SSH keys, cloud credentials, key files, .env files.
+# The .env alternative excludes `process.env.X` via the lookbehind.
+_CRED_PATH = re.compile(
+    r"~[/\\]\.(ssh|aws|gnupg)"
+    r"|\$HOME[/\\]\.(ssh|aws)"
+    r"|\.ssh/|id_rsa|id_ed25519"
+    r"|\.aws/credentials"
+    r"|\.pem\b|\.p12\b|\.pfx\b"
+    r"|(?<![\w.])\.env\b"
+    r"|credentials?\.json|token\.json|secrets?\.ya?ml",
+    re.I,
+)
 
 # Keys whose string values are shell commands.
 HOOK_CMD_KEYS = {"command", "cmd", "shell", "exec", "run", "script", "entrypoint"}
@@ -144,6 +156,14 @@ def audit_hook_command(command: str, relfile: str, line: int) -> List[Finding]:
             f"Hook requests privilege escalation (sudo): {cmd[:120]}",
             "Lifecycle hooks should never need root; drop sudo and run the "
             "mod's setup steps manually with review.",
+        )
+    m = _CRED_PATH.search(cmd)
+    if m:
+        add(
+            "HOOK-CRED-READ", "high",
+            f"Hook touches credential material ({m.group(0)}): {cmd[:120]}",
+            "Hooks must not read SSH keys, cloud credentials, or .env "
+            "files; remove the read and audit where the data goes.",
         )
     if _RM_RF.search(cmd):
         add(
@@ -273,6 +293,15 @@ def scan_ts_source(source: str, relfile: str) -> List[Finding]:
                 "Confine writes to the mod's own directory.",
             )
 
+        m = _CRED_PATH.search(stripped)
+        if m:
+            add(
+                "TS-CRED-PATH", "high", i,
+                f"Credential material referenced ({m.group(0)}) — SSH key, cloud credential, or .env read",
+                "A mod has no legitimate reason to read your SSH keys or "
+                "cloud credentials; remove the read.",
+            )
+
     # Env/API-key exfiltration: secret env var within a few lines of a network sink.
     for i, line in enumerate(lines, start=1):
         if _ENV_SECRET.search(line):
@@ -357,8 +386,139 @@ def scan_permissions(config: dict, relfile: str) -> List[Finding]:
 
 
 # ---------------------------------------------------------------------------
-# 4. Mod-level orchestration + snapshots
+# 4. Mod-level orchestration + snapshots + delta risk report
 # ---------------------------------------------------------------------------
+
+_RISKY_CAP_HINTS = ("shell", "exec", "bash", "network", "internet", "fs", "filesystem")
+
+
+def _perm_capabilities(perms) -> set:
+    """Normalize a permissions value (dict or list) into capability strings."""
+    caps = set()
+    if isinstance(perms, dict):
+        for key, value in perms.items():
+            k = str(key).lower()
+            if value is True or str(value).lower() in (
+                "always", "allow", "true", "*", "write", "read-write", "/",
+            ):
+                caps.add(f"{k}=*")
+            elif isinstance(value, list):
+                for item in value:
+                    caps.add(f"{k}:{str(item).lower()}")
+            elif value:
+                caps.add(f"{k}={str(value).lower()}")
+    elif isinstance(perms, list):
+        for item in perms:
+            caps.add(str(item).lower())
+    return caps
+
+
+def diff_permissions(old_perms: Dict[str, object], new_perms: Dict[str, object]) -> List[Finding]:
+    """Flag permission grants that appeared or widened since the snapshot."""
+    findings: List[Finding] = []
+    for rel in sorted(set(new_perms) | set(old_perms)):
+        old_caps = _perm_capabilities(old_perms.get(rel))
+        new_caps = _perm_capabilities(new_perms.get(rel))
+        if rel not in old_perms and new_perms.get(rel) is not None:
+            findings.append(Finding(
+                "DIFF-PERM-ADDED", "medium", rel, 0,
+                f"Permissions manifest appeared in update: {rel}",
+                "Review the granted capabilities; an update should not "
+                "silently introduce a permissions block.",
+            ))
+            continue
+        for cap in sorted(new_caps - old_caps):
+            severity = (
+                "high"
+                if any(h in cap for h in _RISKY_CAP_HINTS)
+                else "medium"
+            )
+            findings.append(Finding(
+                "DIFF-PERM-WIDENED", severity, rel, 0,
+                f"Permission widened since snapshot ({cap}) in {rel}",
+                "Permission escalation in an update is a classic trojanized-"
+                "update signal; confirm it is documented and necessary.",
+            ))
+        for cap in sorted(old_caps - new_caps):
+            findings.append(Finding(
+                "DIFF-PERM-NARROWED", "low", rel, 0,
+                f"Permission removed since snapshot ({cap}) in {rel}",
+                "Confirm the removal is part of the documented update.",
+            ))
+    return findings
+
+
+def diff_verdict(findings: List[Finding]) -> str:
+    """One-line delta risk verdict from a diff finding list."""
+    if not findings:
+        return "VERDICT: LOW RISK — update delta is clean, no findings."
+    counts: Dict[str, int] = {}
+    for f in findings:
+        counts[f.severity] = counts.get(f.severity, 0) + 1
+    worst = max(counts, key=lambda s: _SEV_ORDER.get(s, 0))
+    breakdown = ", ".join(
+        f"{counts[s]} {s}" for s in SEVERITIES if s in counts
+    )
+    word = {"low": "LOW", "medium": "MEDIUM", "high": "HIGH", "critical": "CRITICAL"}[worst]
+    return f"VERDICT: {word} RISK — {breakdown} finding(s) in the update delta."
+
+
+# Section assignment for the delta risk report, by rule-id prefix.
+_REPORT_SECTIONS = (
+    ("New network exfiltration", ("ENV-EXFIL", "HOOK-EXFIL")),
+    ("Credential-path reads", ("TS-CRED-PATH", "HOOK-CRED-READ")),
+    ("New or swapped hooks", ("DIFF-HOOK-CHANGED", "DIFF-HOOK-REMOVED") + tuple(
+        r for r in ("HOOK-PIPED-DOWNLOAD", "HOOK-B64-EXEC", "HOOK-REVERSE-SHELL",
+                    "HOOK-SUDO", "HOOK-RM-RF", "HOOK-CHMOD-EXEC", "HOOK-SHELL-EXEC"))),
+    ("Permission changes", ("DIFF-PERM-WIDENED", "DIFF-PERM-ADDED",
+                             "DIFF-PERM-NARROWED", "PERM-")),
+    ("File inventory changes", ("DIFF-NEW-FILE", "DIFF-CHANGED-FILE",
+                                "DIFF-REMOVED-FILE")),
+)
+
+
+def _report_section(rule_id: str) -> str:
+    for title, prefixes in _REPORT_SECTIONS:
+        if any(rule_id == p or rule_id.startswith(p) for p in prefixes):
+            return title
+    return "Other delta findings"
+
+
+def format_diff_report(findings: List[Finding], root: str, snapshot: Dict) -> str:
+    """Render the delta risk report: grouped findings + verdict."""
+    lines = [
+        "mod-audit DELTA RISK REPORT",
+        f"Target:   {root}",
+        f"Snapshot: {snapshot.get('generated_at', 'unknown time')} "
+        f"({len(snapshot.get('files', {}))} files hashed)",
+        "",
+    ]
+    if not findings:
+        lines.append("No delta found. The installed mod matches the trusted baseline.")
+        lines.append("")
+        lines.append(diff_verdict(findings))
+        return "\n".join(lines) + "\n"
+    grouped: Dict[str, List[Finding]] = {}
+    order: List[str] = []
+    for f in findings:
+        section = _report_section(f.rule_id)
+        if section not in grouped:
+            grouped[section] = []
+            order.append(section)
+        grouped[section].append(f)
+    for section in order:
+        items = sorted(
+            grouped[section],
+            key=lambda f: (-_SEV_ORDER.get(f.severity, 0), f.file, f.line),
+        )
+        lines.append(f"[{section}] ({len(items)})")
+        for f in items:
+            loc = f"{f.file}:{f.line}" if f.line else f.file
+            lines.append(f"  [{f.severity.upper():8}] {f.rule_id}  {loc}")
+            lines.append(f"             {f.message}")
+        lines.append("")
+    lines.append(diff_verdict(findings))
+    return "\n".join(lines) + "\n"
 
 def _iter_mod_files(root: str) -> Iterator[Tuple[str, str]]:
     """Yield (abspath, relpath) for auditable files, skipping vendored dirs."""
@@ -521,6 +681,21 @@ def diff_against_snapshot(root: str, snapshot: Dict) -> List[Finding]:
             f"Hook command removed since snapshot: {command[:120]}",
             "Confirm the removal is part of the documented update.",
         )
+
+    # Permission delta: grants that appeared, widened, or narrowed.
+    old_perms: Dict[str, object] = snapshot.get("permissions", {})
+    new_perms: Dict[str, object] = {}
+    for abspath, rel in _iter_mod_files(root):
+        if os.path.basename(rel) not in CONFIG_FILES:
+            continue
+        try:
+            with open(abspath, "r", encoding="utf-8", errors="replace") as fh:
+                config = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if isinstance(config, dict) and config.get("permissions") is not None:
+            new_perms[rel] = config["permissions"]
+    findings.extend(diff_permissions(old_perms, new_perms))
     return findings
 
 
