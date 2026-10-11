@@ -42,6 +42,13 @@ class HookRuleTests(unittest.TestCase):
         self.assertTrue(any(x.rule_id == "HOOK-PIPED-DOWNLOAD" for x in f))
         self.assertTrue(all(x.line >= 1 for x in f))
 
+    def test_type_discriminator_not_flagged(self):
+        # The {"type": "command"} discriminator must not be treated as a command.
+        text = '{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo ok"}]}]}}'
+        f = scan_hook_commands(text, "plugin.json")
+        self.assertEqual([x.rule_id for x in f], ["HOOK-SHELL-EXEC"])
+        self.assertIn("echo ok", f[0].message)
+
     def test_scan_hook_commands_bad_json(self):
         self.assertEqual(scan_hook_commands("not json", "plugin.json"), [])
 
